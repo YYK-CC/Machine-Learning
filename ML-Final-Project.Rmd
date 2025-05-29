@@ -1,0 +1,543 @@
+---
+title: "ML final Project"
+author: "Yiyuan Kang & Sydney Cui"
+date: "2025-04-21"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+# Data preparation  
+```{r}
+library(xgboost)
+library(caret)
+library(Matrix)
+library(data.table)
+library(pROC)
+library(dplyr)
+data <- fread("/Users/kangyiyuan/Desktop/ML_Project/alzheimers_prediction_dataset.csv")
+data <- data %>%
+  dplyr::rename_with(~ make.names(gsub("ε", "e", gsub("’", "'", .)), unique = TRUE))
+str(data)
+head(data)
+colnames(data)[colnames(data) == "Alzheimer’s Diagnosis"] <- "Alz"
+print(table(data$Alz))
+char_cols <- names(Filter(is.character, data))
+data[, (char_cols) := lapply(.SD, as.factor), .SDcols = char_cols]
+# dummy
+predictors <- setdiff(names(data), "Alz")
+dummies <- dummyVars(~ ., data = data[, ..predictors], fullRank = TRUE)
+data_dummies <- as.data.frame(predict(dummies, newdata = data[, ..predictors]))
+data_dummies$Alz <- as.factor(data$Alz)
+data_dummies <- data_dummies %>%
+  dplyr::rename_with(~ make.names(gsub("ε", "e", gsub("’", "'", .)), unique = TRUE))
+
+continuous_vars <- data %>%
+  dplyr::select(where(~is.numeric(.) && !all(. %in% c(0, 1))))
+
+categorical_vars <- data %>%
+  dplyr::select(where(~ is.character(.) | is.factor(.) | all(. %in% c(0,1))))
+colnames(continuous_vars)
+colnames(categorical_vars)
+```
+
+
+```{r}
+set.seed(123)
+train_index <- createDataPartition(data_dummies$Alz, p = 0.7, list = FALSE)
+train <- data_dummies[train_index, ]
+test <- data_dummies[-train_index, ]
+dtrain <- xgb.DMatrix(data = as.matrix(train[, -ncol(train)]), label = as.numeric(train$Alz) - 1)
+dtest <- xgb.DMatrix(data = as.matrix(test[, -ncol(test)]), label = as.numeric(test$Alz) - 1)
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6
+)
+
+model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  print_every_n = 10
+)
+model$best_iteration
+pred <- predict(model, dtest)
+pred_label <- ifelse(pred > 0.5, 1, 0)
+confusionMatrix(factor(pred_label), factor(as.numeric(test$Alz) - 1), positive = "1")
+```
+
+
+```{r}
+library(caret)
+train_cv <- train
+train_cv$Alz <- factor(ifelse(train_cv$Alz == "Yes", "yes", "no"))
+
+control <- trainControl(
+  method = "cv",          
+  number = 5,             
+  classProbs = TRUE,      
+  summaryFunction = twoClassSummary 
+)
+
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6),
+  eta = c(0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+set.seed(123)
+xgb_caret <- train(
+  Alz ~ .,
+  data = train_cv,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = control,
+  tuneGrid = xgb_grid
+)
+print(xgb_caret)
+```
+
+
+
+
+```{r}
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 3,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+set.seed(123)
+xgb_final <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  print_every_n = 10
+)
+
+test_label <- as.numeric(test$Alz) - 1
+xgb_caret$bestTune
+xgb_caret$results
+importance <- xgb.importance(model = xgb_final)
+imp_df <- importance[1:20, ]
+imp_df$Feature <- factor(imp_df$Feature, levels = rev(imp_df$Feature))
+ggplot(imp_df, aes(x = Gain, y = Feature)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(
+    title = "Top 20 Important Features by Gain",
+    x = "Relative Importance (Gain)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12)
+
+pred_prob <- predict(xgb_final, dtest)
+roc_obj <- roc(test_label, pred_prob)
+plot(roc_obj, col = "blue", main = "ROC Curve")
+auc(roc_obj)
+
+
+test$pred_prob <- pred_prob
+test$true_label <- test_label
+boxplot(pred_prob ~ test$true_label)
+```
+
+# SHAP  
+```{r}
+library(SHAPforxgboost)
+library(ggplot2)
+library(dplyr)
+
+shap_values <- shap.values(xgb_model = xgb_final, X_train = as.matrix(train[, -ncol(train)]))
+shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = as.matrix(train[, -ncol(train)]))
+
+shap_imp <- shap.importance(shap_long)
+
+#top 15
+top_vars <- shap_imp$variable[1:15]
+shap_long_top15 <- shap_long %>% filter(variable %in% top_vars)
+shap_long_top15$variable <- factor(shap_long_top15$variable, levels = top_vars)
+shap.plot.summary(shap_long_top15)
+```
+
+# Logloss  
+```{r}
+params_log <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  max_depth = 3,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+model_log <- xgb.train(
+  params = params_log,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  print_every_n = 10)
+
+log <- model_log$evaluation_log
+ggplot(log, aes(x = iter)) +
+  geom_line(aes(y = train_logloss, color = "Train")) +
+  geom_line(aes(y = test_logloss, color = "Test")) +
+  geom_point(aes(y = train_logloss, color = "Train"), size = 1) +
+  geom_point(aes(y = test_logloss, color = "Test"), size = 1) + 
+  labs(
+    title = "Learning Curve: Logloss over Iterations",
+    x = "Boosting Iteration",
+    y = "Logloss"
+  ) +
+  scale_color_manual(values = c("Train" = "#3C78B4", "Test" = "orange")) +
+  theme_minimal()
+```
+
+# Train & Test Error
+```{r}
+# Final Training and testing error
+pred_test_prob <- predict(xgb_final, dtest)
+pred_label_final <- ifelse(pred_test_prob > 0.5, 1, 0)
+confusionMatrix(factor(pred_label_final), factor(test_label), positive = "1")
+
+# Testing error rate
+test_error <- mean(pred_label_final != test_label)
+cat("Testing Error Rate:", round(test_error, 4), "\n")
+cat("Testing AUC:", round(auc(roc_obj), 4), "\n")
+
+# Training set performance (optional but recommended)
+pred_train_prob <- predict(xgb_final, dtrain)
+pred_train_label <- ifelse(pred_train_prob > 0.5, 1, 0)
+train_label <- getinfo(dtrain, "label")
+train_error <- mean(pred_train_label != train_label)
+train_roc <- roc(train_label, pred_train_prob)
+cat("Training Error Rate:", round(train_error, 4), "\n")
+cat("Training AUC:", round(auc(train_roc), 4), "\n")
+
+```
+
+# Logistic Regression  
+# Data preparation   
+```{r}
+data1 <-  read.csv("/Users/kangyiyuan/Desktop/ML_Project/alzheimers_prediction_dataset.csv")
+clean_names <- function(x) {
+  x <- gsub("’", "'", x)
+  x <- gsub("[^[:alnum:]_]", "_", x) 
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)   
+  return(x)
+}
+data1<- data1 %>%
+  dplyr::rename_with(~ make.names(gsub("ε", "e", gsub("’", "'", .)), unique = TRUE))
+
+colnames(data1) <- clean_names(colnames(data1))
+colnames(data1)[colnames(data1) == "Alzheimer_s_Diagnosis"] <- "Alz"
+```
+
+
+# Model 1: Initial model(Stepwise AIC)  
+```{r}
+data1$Alz <- factor(data1$Alz)
+cat_cols <- names(Filter(is.character, data1))
+data1[cat_cols] <- lapply(data1[cat_cols], factor)
+
+set.seed(123)
+train_index <- createDataPartition(data1$Alz, p = 0.7, list = FALSE)
+train_logit <- data1[train_index, ]
+test_logit <- data1[-train_index, ]
+
+full_model <- glm(Alz ~.,, data = train_logit, family = "binomial")
+library(car)
+vif(full_model)
+
+step_model <- step(full_model, direction = "both")
+
+summary(step_model)
+vif(step_model)
+# QQ-Plot
+par(mfrow = c(2, 2)) 
+plot(step_model)
+```
+
+# Model 2: Cleaned-Outlier  
+```{r}
+resid_dev <- residuals(step_model, type = "deviance")
+std_pearson <- rstandard(step_model)
+leverage <- hatvalues(step_model)
+cooks_d <- cooks.distance(step_model)
+
+n <- nrow(train_logit)
+p <- length(coef(step_model))
+
+outlier_df <- data.frame(
+  index = 1:n,
+  deviance_resid = resid_dev,
+  std_pearson = std_pearson,
+  leverage = leverage,
+  cooks_d = cooks_d)
+
+
+outliers <- outlier_df %>%
+  filter(
+    abs(std_pearson) > 2 |
+      leverage > 2 * p / n |
+      cooks_d > 4 / n)
+
+cat("Number of potential outliers:", nrow(outliers), "\n")
+
+# Exclude outlier
+train_cleaned <- train_logit[-outliers$index, ]
+
+# Refit
+model_cleaned <- glm(formula(step_model), data = train_cleaned, family = "binomial")
+summary(model_cleaned)
+```
+
+# Model 3: Interation  
+```{r}
+interaction_model <- glm(
+  Alz ~ Country + Age + Cholesterol_Level + 
+    Family_History_of_Alzheimer_s + Genetic_Risk_Factor_APOE_e4_allele + 
+    Urban_vs_Rural_Living + 
+    Age:Genetic_Risk_Factor_APOE_e4_allele + 
+    Country:Age + 
+    Country:Genetic_Risk_Factor_APOE_e4_allele,
+  data = train_logit,
+  family = "binomial")
+
+interaction_step <- step(interaction_model, direction = "both")
+
+summary(interaction_step)
+```
+
+# Testing Set
+```{r}
+# Convert outcome to numeric for ROC
+test_label_logit <- ifelse(test_logit$Alz == "Yes", 1, 0)
+
+## 1. stepwise 
+pred_orig <- predict(step_model, newdata = test_logit, type = "response")
+pred_class_orig <- ifelse(pred_orig > 0.5, "Yes", "No") |> factor(levels = levels(test_logit$Alz))
+auc_orig <- roc(test_label_logit, pred_orig)$auc
+conf_orig <- confusionMatrix(pred_class_orig, test_logit$Alz, positive = "Yes")
+
+## 2. Cleaned
+pred_clean <- predict(model_cleaned, newdata = test_logit, type = "response")
+pred_class_clean <- ifelse(pred_clean > 0.5, "Yes", "No") |> factor(levels = levels(test_logit$Alz))
+auc_clean <- roc(test_label_logit, pred_clean)$auc
+conf_clean <- confusionMatrix(pred_class_clean, test_logit$Alz, positive = "Yes")
+
+pred_inter <- predict(interaction_step, newdata = test_logit, type = "response")
+pred_class_inter <- ifelse(pred_inter > 0.5, "Yes", "No") |> factor(levels = levels(test_logit$Alz))
+auc_inter <- roc(test_label_logit, pred_inter)$auc
+conf_inter <- confusionMatrix(pred_class_inter, test_logit$Alz, positive = "Yes")
+
+comparison_df <- data.frame(
+  Model = c("Stepwise", "Cleaned", "Interaction"),
+  AUC = c(round(auc_orig, 4), round(auc_clean, 4), round(auc_inter, 4)),
+  Accuracy = c(
+    round(conf_orig$overall["Accuracy"], 4),
+    round(conf_clean$overall["Accuracy"], 4),
+    round(conf_inter$overall["Accuracy"], 4)), 
+  AIC = c(AIC(step_model), AIC(model_cleaned), AIC(interaction_step)),
+  BIC = c(BIC(step_model), BIC(model_cleaned), BIC(interaction_step)))
+print(comparison_df)
+```
+
+# ROC graph for XGBoost and Logistic Cleaned  
+```{r}
+library(pROC)
+pred_test_prob <- predict(xgb_final, dtest)
+roc_obj <- roc(test_label, pred_test_prob)
+auc_obj <- auc(roc_obj)
+roc_clean <- roc(test_logit$Alz, pred_clean)
+auc_clean <- auc(roc_clean)
+# XGBoost and Logistic ROC Plot
+plot(roc_clean, col = "darkorange", lwd = 2,
+     main = "ROC Curve Comparison",
+     legacy.axes = FALSE,
+     xlim = c(1, 0), ylim = c(0, 1),
+     xlab = "Specificity", ylab = "Sensitivity")
+lines(roc_obj, col = "blue", lwd = 2)
+# Add legend
+legend("bottomright",
+       legend = c(
+         paste("Logistic (AUC =", round(auc(roc_clean), 3), ")"),
+         paste("XGBoost (AUC =", round(auc(roc_obj), 3), ")")
+       ),
+       col = c("darkorange", "blue"),
+       lwd = 3,
+       cex = 1.2,
+       bty = "n")
+```
+
+# 5-folder CV  
+```{r}
+data1$Alz <- factor(ifelse(data1$Alz == "Yes", "yes", "no"))
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Model 1：step model
+set.seed(123)
+cv_main <- train(
+  Alz ~ Country + Age + Cholesterol_Level + Family_History_of_Alzheimer_s +
+    Genetic_Risk_Factor_APOE_e4_allele + Urban_vs_Rural_Living,
+  data = train_logit,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC")
+
+# Step cleaned model
+cv_cleaned <- train(
+  Alz ~ Country + Age + Cholesterol_Level + Family_History_of_Alzheimer_s +
+    Genetic_Risk_Factor_APOE_e4_allele + Urban_vs_Rural_Living,
+  data = train_cleaned,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC")
+
+# Model 3：interaction model
+cv_inter <- train(
+  Alz ~ Country + Age + Cholesterol_Level + Family_History_of_Alzheimer_s +
+    Genetic_Risk_Factor_APOE_e4_allele + Urban_vs_Rural_Living +
+    Age:Genetic_Risk_Factor_APOE_e4_allele,
+  data = train_logit,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+# Compare AUC
+cv_main
+cv_cleaned 
+cv_inter
+
+comparison_df_total <- data.frame(
+  Model = c("Stepwise", "Cleaned", "Interaction"),
+  
+  # Test set metrics
+  AUC = c(round(auc_orig, 4), round(auc_clean, 4), round(auc_inter, 4)),
+  Accuracy = c(
+    round(conf_orig$overall["Accuracy"], 4),
+    round(conf_clean$overall["Accuracy"], 4),
+    round(conf_inter$overall["Accuracy"], 4)),
+  AIC = c(
+    round(AIC(step_model), 2),
+    round(AIC(model_cleaned), 2),
+    round(AIC(interaction_step), 2)),
+  BIC = c(
+    round(BIC(step_model), 2),
+    round(BIC(model_cleaned), 2),
+    round(BIC(interaction_step), 2)),
+  
+  # Cross-validation metrics
+  CV_ROC = c(
+    round(cv_main$results$ROC, 4),
+    round(cv_cleaned$results$ROC, 4),
+    round(cv_inter$results$ROC, 4)),
+  CV_Sensitivity = c(
+    round(cv_main$results$Sens, 4),
+    round(cv_cleaned$results$Sens, 4),
+    round(cv_inter$results$Sens, 4)),
+  CV_Specificity = c(
+    round(cv_main$results$Spec, 4),
+    round(cv_cleaned$results$Spec, 4),
+    round(cv_inter$results$Spec, 4)))
+print(comparison_df_total)
+```
+
+# Table  
+```{r}
+library(gt)
+library(gtExtras)
+conf_clean <- confusionMatrix(pred_class_clean, test_logit$Alz, positive = "Yes")
+conf_xgb <- confusionMatrix(factor(pred_label_final), factor(test_label), positive = "1")
+# CV
+comparison_df_total |>
+  gt() |>
+  tab_header(title = md("**Logistic Model Comparison (Test Set & Cross-Validation)**")) |>
+  fmt_number(columns = c(AUC, Accuracy, CV_ROC, CV_Sensitivity, CV_Specificity), decimals = 4) |>
+  fmt_number(columns = c(AIC, BIC), decimals = 0, use_seps = TRUE) |>
+  cols_align(align = "center", columns = everything()) |>
+  tab_style(
+    style = cell_fill(color = "#eaf4ea"),
+    locations = cells_body(rows = Model == "Cleaned")
+  ) |>
+  opt_table_font(font = list(gt::google_font("Roboto"))) |>
+  opt_row_striping() |>
+  tab_options(
+    table.font.size = 14,
+    column_labels.font.weight = "bold",
+    table.width = pct(95)
+  )
+
+# Calculate F1 Score (From ConfusionMatrix)
+get_f1 <- function(conf) {
+  precision <- conf$byClass["Pos Pred Value"]
+  recall <- conf$byClass["Sensitivity"]
+  2 * precision * recall / (precision + recall)
+}
+
+# Table
+model_comp <- data.frame(
+  Metric = c("AUC", "Accuracy", "Sensitivity", "Specificity", "F1_Score"),
+  Logistic = c(
+    round(auc_clean, 3),
+    round(conf_clean$overall["Accuracy"], 3),
+    round(conf_clean$byClass["Sensitivity"], 3),
+    round(conf_clean$byClass["Specificity"], 3),
+    round(get_f1(conf_clean), 3)),
+  XGBoost = c(
+    round(auc_obj, 3),
+    round(conf_xgb$overall["Accuracy"], 3),
+    round(conf_xgb$byClass["Sensitivity"], 3),
+    round(conf_xgb$byClass["Specificity"], 3),
+    round(get_f1(conf_xgb), 3)))
+
+model_comp |>
+  gt() |>
+  tab_header(title = md("**Model Performance Comparison**")) |>
+  fmt_number(columns = where(is.numeric), decimals = 3) |>
+  cols_align(align = "center", columns = everything()) |>
+  tab_style(
+    style = cell_fill(color = "#eaf4ea"),
+    locations = cells_body(columns = "XGBoost")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#eaf4ea"),
+    locations = cells_column_labels(columns = "XGBoost")
+  ) |>
+  opt_table_font(font = list(gt::google_font("Roboto"))) |>
+  opt_row_striping() |>
+  tab_options(
+    table.font.size = 14,
+    column_labels.font.weight = "bold",
+    table.width = pct(80)
+  )
+```
+
+
+
+
+
+
+
+
