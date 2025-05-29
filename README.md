@@ -1,0 +1,1 @@
+Using the Alzheimer’s Disease Prediction Dataset from Kaggle, which includes variables such as age, sex, family history, lifestyle factors (e.g., physical activity, diet, sleep), and genetic risk indicators (e.g., APOE-ε4 status), with two machine learning models—primarily XGBoost, supported by Logistic Regression and Random Forest—to predict Alzheimer’s diagnosis.
